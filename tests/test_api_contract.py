@@ -1,20 +1,31 @@
 from __future__ import annotations
 
-import base64
+import math
 import unittest
 
-import cv2  # type: ignore
-import numpy as np
 from fastapi.testclient import TestClient
 
 from app.main import app
 
 
-def make_roi_b64() -> str:
-    roi = np.full((96, 96, 3), 120, dtype=np.uint8)
-    ok, enc = cv2.imencode(".jpg", roi)
-    assert ok
-    return base64.b64encode(enc.tobytes()).decode("ascii")
+def make_summary_payload(seq: int, timestamp_ms: int) -> dict[str, object]:
+    pulse = math.sin(2.0 * math.pi * 1.2 * (timestamp_ms / 1000.0))
+    return {
+        "type": "sample_summary_chunk",
+        "seq": seq,
+        "timestamp_ms": timestamp_ms,
+        "patches": [
+            {"patch_id": "p0", "mean_rgb": [130.0 + pulse * 6.0, 118.0 + pulse * 4.0, 95.0], "weight": 1.0},
+            {"patch_id": "p1", "mean_rgb": [132.0 + pulse * 5.0, 120.0 + pulse * 3.0, 96.0], "weight": 1.0},
+            {"patch_id": "p2", "mean_rgb": [128.0 + pulse * 4.0, 117.0 + pulse * 2.0, 94.0], "weight": 1.0},
+        ],
+        "local_quality": {
+            "face_present": True,
+            "brightness": 0.48,
+            "motion_score": 0.04,
+            "roi_coverage": 0.92,
+        },
+    }
 
 
 class ApiContractTests(unittest.TestCase):
@@ -22,41 +33,48 @@ class ApiContractTests(unittest.TestCase):
         self.client = TestClient(app)
 
     def test_session_lifecycle(self) -> None:
-        create = self.client.post("/v1/liveness/sessions", json={"device_id": "test"})
+        create = self.client.post("/v1/liveness/sessions", json={"device_id": "test", "preferred_method": "pos"})
         self.assertEqual(create.status_code, 200)
         body = create.json()
         session_id = body["session_id"]
         token = body["access_token"]
+        self.assertEqual(body["capture_config"]["transport_format"], "patch_rgb_v1")
 
+        seen_quality = False
         with self.client.websocket_connect(f"/v1/liveness/sessions/{session_id}/stream?token={token}") as ws:
-            for i in range(30):
-                ws.send_json(
-                    {
-                        "type": "roi_frame_chunk",
-                        "session_id": session_id,
-                        "seq": i,
-                        "timestamp_ms": i * 83,
-                        "image_format": "jpeg",
-                        "image_bytes_b64": make_roi_b64(),
-                    }
-                )
-                _ = ws.receive_json()
+            for i in range(24):
+                ws.send_json(make_summary_payload(seq=i, timestamp_ms=i * 83))
+                ack = ws.receive_json()
+                quality = ws.receive_json()
+                self.assertEqual(ack["type"], "ack")
+                self.assertEqual(quality["type"], "quality_feedback")
+                seen_quality = True
             ws.send_json({"type": "end_stream"})
             complete = ws.receive_json()
             self.assertEqual(complete.get("type"), "complete")
+
+        self.assertTrue(seen_quality)
 
         result = self.client.get(f"/v1/liveness/sessions/{session_id}/result")
         self.assertEqual(result.status_code, 200)
         rj = result.json()
         self.assertEqual(rj["status"], "complete")
         self.assertIn(rj["decision"], ["live", "not_live", "inconclusive"])
+        self.assertIn("operational_metrics", rj)
+
+        diagnostics = self.client.get(f"/v1/liveness/sessions/{session_id}/diagnostics")
+        self.assertEqual(diagnostics.status_code, 200)
+        dj = diagnostics.json()
+        self.assertEqual(dj["session_id"], session_id)
+        self.assertGreaterEqual(dj["packets_received"], 24)
 
     def test_missing_token_rejected(self) -> None:
         create = self.client.post("/v1/liveness/sessions", json={})
         session_id = create.json()["session_id"]
-        with self.assertRaises(Exception):
-            with self.client.websocket_connect(f"/v1/liveness/sessions/{session_id}/stream"):
-                pass
+        with self.client.websocket_connect(f"/v1/liveness/sessions/{session_id}/stream") as ws:
+            error = ws.receive_json()
+            self.assertEqual(error["type"], "error")
+            self.assertEqual(error["code"], "invalid_token")
 
 
 if __name__ == "__main__":

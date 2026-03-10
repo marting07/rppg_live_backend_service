@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Replay local videos through the live liveness evaluator for Track B experiments."""
+"""Replay local videos through the live summary-stream evaluator for Track B experiments."""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import hashlib
-import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import cv2  # type: ignore
+import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -33,7 +34,7 @@ def stable_session_id(video_path: str, expected_label: str) -> str:
     return f"live_{digest}"
 
 
-def center_roi(frame, roi_w: int = 96, roi_h: int = 96):
+def center_roi(frame: np.ndarray, roi_w: int = 96, roi_h: int = 96) -> np.ndarray:
     h, w = frame.shape[:2]
     cx = w // 2
     cy = h // 3
@@ -42,6 +43,46 @@ def center_roi(frame, roi_w: int = 96, roi_h: int = 96):
     x1 = min(w, x0 + roi_w)
     y1 = min(h, y0 + roi_h)
     return frame[y0:y1, x0:x1]
+
+
+def build_patch_payload(roi: np.ndarray, seq: int, timestamp_ms: int) -> dict[str, Any]:
+    rows = 2
+    cols = 3
+    patches: list[dict[str, Any]] = []
+    patch_h = max(1, roi.shape[0] // rows)
+    patch_w = max(1, roi.shape[1] // cols)
+    prev_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    brightness = float(np.mean(prev_gray) / 255.0)
+    for row in range(rows):
+        for col in range(cols):
+            y0 = row * patch_h
+            y1 = roi.shape[0] if row == rows - 1 else min(roi.shape[0], (row + 1) * patch_h)
+            x0 = col * patch_w
+            x1 = roi.shape[1] if col == cols - 1 else min(roi.shape[1], (col + 1) * patch_w)
+            patch = roi[y0:y1, x0:x1]
+            if patch.size == 0:
+                continue
+            mean_bgr = np.mean(patch.reshape(-1, 3), axis=0)
+            patches.append(
+                {
+                    "patch_id": f"r{row}c{col}",
+                    "mean_rgb": [float(mean_bgr[2]), float(mean_bgr[1]), float(mean_bgr[0])],
+                    "weight": float(patch.shape[0] * patch.shape[1]),
+                }
+            )
+
+    return {
+        "type": "sample_summary_chunk",
+        "seq": seq,
+        "timestamp_ms": timestamp_ms,
+        "patches": patches,
+        "local_quality": {
+            "face_present": True,
+            "brightness": brightness,
+            "motion_score": 0.0,
+            "roi_coverage": 1.0,
+        },
+    }
 
 
 def run_one(video_path: Path, expected_label: str, fps: float, max_seconds: float, output_root: Path, session_id: str) -> dict[str, object]:
@@ -54,6 +95,13 @@ def run_one(video_path: Path, expected_label: str, fps: float, max_seconds: floa
             "liveness_score": "",
             "confidence": "",
             "expected_label": expected_label,
+            "selected_method": "",
+            "time_to_first_estimate_ms": "",
+            "time_to_stable_estimate_ms": "",
+            "valid_window_rate": "",
+            "recoverability_rate": "",
+            "mean_bandwidth_bps": "",
+            "packet_loss_rate": "",
             "error": f"cannot_open_video:{video_path}",
         }
 
@@ -71,17 +119,20 @@ def run_one(video_path: Path, expected_label: str, fps: float, max_seconds: floa
             break
         if frame_idx % step == 0:
             roi = center_roi(frame)
-            ok_enc, enc = cv2.imencode(".jpg", roi)
-            if ok_enc:
-                import base64
-
-                b64 = base64.b64encode(enc.tobytes()).decode("ascii")
-                evaluator.ingest_roi_payload(b64)
-                sent += 1
+            packet = build_patch_payload(roi, seq=sent, timestamp_ms=int(round((sent / fps) * 1000.0)))
+            evaluator.ingest_summary_packet(
+                seq=packet["seq"],
+                timestamp_ms=packet["timestamp_ms"],
+                patches=packet["patches"],
+                local_quality=packet["local_quality"],
+                payload_size_bytes=len(str(packet)),
+            )
+            sent += 1
         frame_idx += 1
     cap.release()
 
     result = evaluator.finalize(session_id=session_id, output_root=output_root)
+    operational = result.get("operational_metrics", {})
     return {
         "session_id": session_id,
         "status": str(result.get("status", "")),
@@ -89,8 +140,21 @@ def run_one(video_path: Path, expected_label: str, fps: float, max_seconds: floa
         "liveness_score": f"{float(result.get('liveness_score', 0.0)):.6f}",
         "confidence": f"{float(result.get('confidence', 0.0)):.6f}",
         "expected_label": expected_label,
+        "selected_method": str(result.get("selected_method", "") or ""),
+        "time_to_first_estimate_ms": _fmt_metric(operational.get("time_to_first_estimate_ms")),
+        "time_to_stable_estimate_ms": _fmt_metric(operational.get("time_to_stable_estimate_ms")),
+        "valid_window_rate": _fmt_metric(operational.get("valid_window_rate")),
+        "recoverability_rate": _fmt_metric(operational.get("recoverability_rate")),
+        "mean_bandwidth_bps": _fmt_metric(operational.get("mean_bandwidth_bps")),
+        "packet_loss_rate": _fmt_metric(operational.get("packet_loss_rate")),
         "error": "",
     }
+
+
+def _fmt_metric(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    return f"{float(value):.6f}"
 
 
 def main() -> int:
@@ -114,7 +178,22 @@ def main() -> int:
     with args.out.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["session_id", "status", "decision", "liveness_score", "confidence", "expected_label", "error"],
+            fieldnames=[
+                "session_id",
+                "status",
+                "decision",
+                "liveness_score",
+                "confidence",
+                "expected_label",
+                "selected_method",
+                "time_to_first_estimate_ms",
+                "time_to_stable_estimate_ms",
+                "valid_window_rate",
+                "recoverability_rate",
+                "mean_bandwidth_bps",
+                "packet_loss_rate",
+                "error",
+            ],
         )
         writer.writeheader()
         writer.writerows(out_rows)
