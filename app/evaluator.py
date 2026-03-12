@@ -32,6 +32,7 @@ class QualityStats:
 class StreamEvaluator:
     fs: float = 12.0
     buffer_seconds: int = 10
+    preferred_method: str | None = None
     methods: dict[str, object] = field(default_factory=dict)
     quality: QualityStats = field(default_factory=QualityStats)
     packet_trace: list[dict[str, Any]] = field(default_factory=list)
@@ -48,12 +49,17 @@ class StreamEvaluator:
 
     def __post_init__(self) -> None:
         buf = int(self.fs * self.buffer_seconds)
-        # Selected live methods use compact RGB summaries without backend-side ROI images.
-        self.methods = {
+        available_methods = {
             "green": GreenMethod(fs=self.fs, buffer_size=buf),
             "chrom": ChromMethod(fs=self.fs, buffer_size=buf),
             "pos": POSMethod(fs=self.fs, buffer_size=buf),
         }
+        preferred = (self.preferred_method or "").lower().strip()
+        if preferred in available_methods:
+            self.methods = {preferred: available_methods[preferred]}
+        else:
+            # Selected live methods use compact RGB summaries without backend-side ROI images.
+            self.methods = available_methods
         self._hr_history = {k: [] for k in self.methods}
         self._conf_history = {k: [] for k in self.methods}
 
@@ -274,7 +280,7 @@ class StreamEvaluator:
     def _build_result_event(self, *, timestamp_ms: int, method_state: dict[str, dict[str, float]]) -> dict[str, Any] | None:
         if not method_state:
             return None
-        selected_method = max(method_state.items(), key=lambda item: (item[1]["confidence"], item[1]["bpm"]))[0]
+        selected_method = self._choose_method(method_state)
         selected = method_state[selected_method]
         confidences = np.array([entry["confidence"] for entry in method_state.values()], dtype=np.float64)
         bpms = np.array([entry["bpm"] for entry in method_state.values()], dtype=np.float64)
@@ -303,16 +309,33 @@ class StreamEvaluator:
         return result_event
 
     def _select_best_method(self) -> str | None:
+        ranked = self._rank_methods()
+        if not ranked:
+            return None
+        return ranked[0][2]
+
+    def _choose_method(self, method_state: dict[str, dict[str, float]]) -> str:
+        preferred = self.preferred_method
+        if preferred and preferred in method_state:
+            return preferred
+
+        ranked = [entry for entry in self._rank_methods(method_state=method_state) if entry[2] in method_state]
+        if ranked:
+            return ranked[0][2]
+        return max(method_state.items(), key=lambda item: (item[1]["confidence"], item[1]["bpm"]))[0]
+
+    def _rank_methods(self, *, method_state: dict[str, dict[str, float]] | None = None) -> list[tuple[float, int, str]]:
         ranked = []
         for name, values in self._hr_history.items():
             if not values:
                 continue
             mean_conf = float(np.mean(np.array(self._conf_history[name], dtype=np.float64))) if self._conf_history[name] else 0.0
-            ranked.append((mean_conf, len(values), name))
-        if not ranked:
-            return None
+            current_conf = 0.0
+            if method_state is not None and name in method_state:
+                current_conf = float(method_state[name].get("confidence", 0.0))
+            ranked.append((mean_conf + 0.05 * current_conf, len(values), name))
         ranked.sort(reverse=True)
-        return ranked[0][2]
+        return ranked
 
     def _packet_loss_rate(self) -> float:
         delivered = self.quality.total_packets + self.quality.dropped_packets

@@ -46,6 +46,7 @@ class SessionStore:
             device_id=device_id,
             app_version=app_version,
             preferred_method=preferred_method,
+            evaluator=StreamEvaluator(preferred_method=preferred_method),
         )
         self._sessions[sid] = state
         return state
