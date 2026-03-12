@@ -14,7 +14,7 @@ PAPERS_ROOT = Path(__file__).resolve().parents[2]
 if str(PAPERS_ROOT) not in sys.path:
     sys.path.insert(0, str(PAPERS_ROOT))
 
-from rppg_core import ChromMethod, GreenMethod, POSMethod
+from rppg_core import ChromMethod, ICAMethod, POSMethod
 
 
 @dataclass
@@ -46,20 +46,19 @@ class StreamEvaluator:
     _first_estimate_ms: int | None = None
     _first_stable_ms: int | None = None
     _last_timestamp_ms: int | None = None
+    _accepted_bgr_history: list[tuple[float, float, float]] = field(default_factory=list)
+    _session_start_seq: int | None = None
+    _first_estimate_seq: int | None = None
+    _first_stable_seq: int | None = None
 
     def __post_init__(self) -> None:
         buf = int(self.fs * self.buffer_seconds)
-        available_methods = {
-            "green": GreenMethod(fs=self.fs, buffer_size=buf),
+        # Backend remains the source of truth and evaluates multiple methods for decision robustness.
+        self.methods = {
             "chrom": ChromMethod(fs=self.fs, buffer_size=buf),
             "pos": POSMethod(fs=self.fs, buffer_size=buf),
+            "ica": ICAMethod(fs=self.fs, buffer_size=buf),
         }
-        preferred = (self.preferred_method or "").lower().strip()
-        if preferred in available_methods:
-            self.methods = {preferred: available_methods[preferred]}
-        else:
-            # Selected live methods use compact RGB summaries without backend-side ROI images.
-            self.methods = available_methods
         self._hr_history = {k: [] for k in self.methods}
         self._conf_history = {k: [] for k in self.methods}
 
@@ -77,6 +76,8 @@ class StreamEvaluator:
 
         if self._session_start_ms is None:
             self._session_start_ms = timestamp_ms
+        if self._session_start_seq is None:
+            self._session_start_seq = seq
 
         if not patches:
             return {"accepted": 0, "error": "missing_patches"}
@@ -133,6 +134,7 @@ class StreamEvaluator:
             return {"accepted": 0, **packet_info}
 
         self.quality.accepted_packets += 1
+        self._accepted_bgr_history.append(bgr)
         roi = self._synthetic_roi_from_bgr(bgr)
         method_state: dict[str, dict[str, float]] = {}
         for name, method in self.methods.items():
@@ -159,7 +161,7 @@ class StreamEvaluator:
             }
         )
 
-        result_event = self._build_result_event(timestamp_ms=timestamp_ms, method_state=method_state)
+        result_event = self._build_result_event(seq=seq, timestamp_ms=timestamp_ms, method_state=method_state)
         response = {"accepted": 1, **packet_info}
         if result_event is not None:
             response["result_event"] = result_event
@@ -181,28 +183,37 @@ class StreamEvaluator:
         recoverability_rate = float(recoverable_methods) / float(len(self.methods)) if self.methods else 0.0
 
         per_method_summary: dict[str, dict[str, float]] = {}
-        stable_method_votes = 0
+        method_stability_scores: list[float] = []
         for name, values in self._hr_history.items():
             if not values:
-                per_method_summary[name] = {"samples": 0.0, "median_bpm": 0.0, "mean_confidence": 0.0}
+                per_method_summary[name] = {"samples": 0.0, "median_bpm": 0.0, "mean_confidence": 0.0, "stability_score": 0.0}
                 continue
             arr = np.array(values, dtype=np.float64)
             conf_arr = np.array(self._conf_history[name], dtype=np.float64) if self._conf_history[name] else np.array([], dtype=np.float64)
             median_bpm = float(np.median(arr))
             bpm_std = float(np.std(arr))
             mean_confidence = float(np.mean(conf_arr)) if conf_arr.size else 0.0
+            stability_score = self._method_stability_score(
+                samples=int(arr.size),
+                bpm_std=bpm_std,
+                mean_confidence=mean_confidence,
+            )
             per_method_summary[name] = {
                 "samples": float(arr.size),
                 "median_bpm": median_bpm,
                 "bpm_std": bpm_std,
                 "mean_confidence": mean_confidence,
+                "stability_score": stability_score,
             }
-            if arr.size >= 5 and bpm_std <= 5.0 and mean_confidence >= 1.05:
-                stable_method_votes += 1
+            method_stability_scores.append(stability_score)
 
-        method_ratio = float(stable_method_votes) / float(len(self.methods)) if self.methods else 0.0
-        liveness_score = float(np.clip(0.55 * method_ratio + 0.25 * quality_ratio + 0.20 * recoverability_rate, 0.0, 1.0))
-        confidence = float(np.clip((method_ratio + quality_ratio + recoverability_rate) / 3.0, 0.0, 1.0))
+        method_ratio = float(np.mean(np.array(method_stability_scores, dtype=np.float64))) if method_stability_scores else 0.0
+        plausibility = self._signal_plausibility(per_method_summary)
+        agreement_support = self._agreement_support(per_method_summary)
+        liveness_score = float(
+            np.clip(0.42 * method_ratio + 0.23 * quality_ratio + 0.15 * recoverability_rate + 0.20 * plausibility["score"], 0.0, 1.0)
+        )
+        confidence = float(np.clip((method_ratio + quality_ratio + recoverability_rate + plausibility["score"]) / 4.0, 0.0, 1.0))
 
         decision = "live"
         failure_reasons: list[str] = []
@@ -215,9 +226,27 @@ class StreamEvaluator:
         elif recoverability_rate < 0.34:
             decision = "inconclusive"
             failure_reasons.append("low_recoverability")
-        elif liveness_score < 0.65:
-            decision = "not_live"
+        elif agreement_support["recoverable_methods"] < 2:
+            decision = "inconclusive"
+            failure_reasons.append("single_method_evidence")
+        elif agreement_support["agreeing_methods"] < 2:
+            decision = "inconclusive"
+            failure_reasons.append("insufficient_method_agreement")
+        elif not agreement_support["has_chromatic_support"]:
+            decision = "inconclusive"
+            failure_reasons.append("missing_chromatic_support")
+        elif plausibility["score"] < 0.72:
+            decision = "inconclusive"
+            failure_reasons.append("weak_physiological_plausibility")
+        elif plausibility["suspicious"]:
+            decision = "inconclusive"
+            failure_reasons.extend(plausibility["reasons"])
+        elif liveness_score < 0.55:
+            decision = "inconclusive"
             failure_reasons.append("insufficient_method_stability")
+        elif method_ratio < 0.25 and quality_ratio >= 0.70 and recoverability_rate >= 0.70:
+            decision = "not_live"
+            failure_reasons.append("persistent_instability")
 
         mean_payload_bytes = float(self.quality.bytes_received) / float(self.quality.total_packets) if self.quality.total_packets else 0.0
         mean_bandwidth_bps = mean_payload_bytes * self.fs
@@ -246,8 +275,8 @@ class StreamEvaluator:
                 "accepted_packets": float(self.quality.accepted_packets),
             },
             "operational_metrics": {
-                "time_to_first_estimate_ms": self._elapsed_or_none(self._first_estimate_ms),
-                "time_to_stable_estimate_ms": self._elapsed_or_none(self._first_stable_ms),
+                "time_to_first_estimate_ms": self._elapsed_from_seq(self._first_estimate_seq),
+                "time_to_stable_estimate_ms": self._elapsed_from_seq(self._first_stable_seq),
                 "valid_window_rate": quality_ratio,
                 "recoverability_rate": recoverability_rate,
                 "stable_estimate_rate": method_ratio,
@@ -258,6 +287,16 @@ class StreamEvaluator:
                 "packet_loss_rate": self._packet_loss_rate(),
             },
             "method_summary": per_method_summary,
+            "plausibility_summary": {
+                "score": plausibility["score"],
+                "channel_pulsatility": plausibility["channel_pulsatility"],
+                "channel_divergence": plausibility["channel_divergence"],
+                "brightness_variation": plausibility["brightness_variation"],
+                "method_agreement_score": plausibility["method_agreement_score"],
+                "recoverable_methods": float(agreement_support["recoverable_methods"]),
+                "agreeing_methods": float(agreement_support["agreeing_methods"]),
+                "has_chromatic_support": float(1 if agreement_support["has_chromatic_support"] else 0),
+            },
             "failure_reasons": failure_reasons,
             "computed_at": datetime.now(UTC).isoformat(),
         }
@@ -277,7 +316,7 @@ class StreamEvaluator:
         (run_dir / "diagnostics.json").write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
         return result
 
-    def _build_result_event(self, *, timestamp_ms: int, method_state: dict[str, dict[str, float]]) -> dict[str, Any] | None:
+    def _build_result_event(self, *, seq: int, timestamp_ms: int, method_state: dict[str, dict[str, float]]) -> dict[str, Any] | None:
         if not method_state:
             return None
         selected_method = self._choose_method(method_state)
@@ -292,8 +331,12 @@ class StreamEvaluator:
         kind = "stable_result" if stable else "provisional_result"
         if self._first_estimate_ms is None:
             self._first_estimate_ms = timestamp_ms
+        if self._first_estimate_seq is None:
+            self._first_estimate_seq = seq
         if stable and self._first_stable_ms is None:
             self._first_stable_ms = timestamp_ms
+        if stable and self._first_stable_seq is None:
+            self._first_stable_seq = seq
 
         result_event = {
             "type": kind,
@@ -347,6 +390,112 @@ class StreamEvaluator:
         if timestamp_ms is None or self._session_start_ms is None:
             return None
         return float(max(0, timestamp_ms - self._session_start_ms))
+
+    def _elapsed_from_seq(self, seq: int | None) -> float | None:
+        if seq is None or self._session_start_seq is None:
+            return None
+        return float(max(0.0, ((seq - self._session_start_seq) / max(self.fs, 1e-6)) * 1000.0))
+
+    def _signal_plausibility(self, per_method_summary: dict[str, dict[str, float]]) -> dict[str, Any]:
+        if not self._accepted_bgr_history:
+            return {
+                "score": 0.0,
+                "suspicious": True,
+                "reasons": ["no_accepted_signal"],
+                "channel_pulsatility": 0.0,
+                "channel_divergence": 0.0,
+                "brightness_variation": 0.0,
+                "method_agreement_score": 0.0,
+            }
+
+        arr = np.array(self._accepted_bgr_history, dtype=np.float64)
+        # History is stored as BGR.
+        b = arr[:, 0]
+        g = arr[:, 1]
+        r = arr[:, 2]
+        eps = 1e-6
+        g_norm = (g / max(float(np.mean(g)), eps)) - 1.0
+        r_norm = (r / max(float(np.mean(r)), eps)) - 1.0
+        b_norm = (b / max(float(np.mean(b)), eps)) - 1.0
+        brightness = np.mean(arr, axis=1) / 255.0
+
+        channel_pulsatility = float(np.std(g_norm))
+        channel_divergence = float(max(np.std(g_norm - r_norm), np.std(g_norm - b_norm)))
+        brightness_variation = float(np.std(brightness))
+        method_agreement_score = self._method_agreement_score(per_method_summary)
+
+        pulsatility_score = float(np.clip(channel_pulsatility / 0.006, 0.0, 1.0))
+        divergence_score = float(np.clip(channel_divergence / 0.004, 0.0, 1.0))
+        brightness_score = float(np.clip(brightness_variation / 0.01, 0.0, 1.0))
+        plausibility_score = float(
+            np.clip(
+                0.40 * pulsatility_score
+                + 0.25 * divergence_score
+                + 0.15 * brightness_score
+                + 0.20 * method_agreement_score,
+                0.0,
+                1.0,
+            )
+        )
+
+        suspicious_reasons: list[str] = []
+        if channel_pulsatility < 0.0025:
+            suspicious_reasons.append("low_pulsatility")
+        if channel_divergence < 0.0015:
+            suspicious_reasons.append("low_channel_divergence")
+        if len(per_method_summary) > 1 and method_agreement_score < 0.50:
+            suspicious_reasons.append("poor_method_agreement")
+        if brightness_variation < 0.0015 and channel_pulsatility < 0.003:
+            suspicious_reasons.append("low_information_signal")
+        if channel_pulsatility < 0.004 and brightness_variation < 0.003:
+            suspicious_reasons.append("brightness_dominant_signal")
+
+        return {
+            "score": plausibility_score,
+            "suspicious": bool(suspicious_reasons),
+            "reasons": suspicious_reasons,
+            "channel_pulsatility": channel_pulsatility,
+            "channel_divergence": channel_divergence,
+            "brightness_variation": brightness_variation,
+            "method_agreement_score": method_agreement_score,
+        }
+
+    @staticmethod
+    def _method_stability_score(*, samples: int, bpm_std: float, mean_confidence: float) -> float:
+        sample_score = float(np.clip(samples / 8.0, 0.0, 1.0))
+        bpm_score = float(np.clip((10.0 - bpm_std) / 10.0, 0.0, 1.0))
+        confidence_score = float(np.clip(mean_confidence / 0.75, 0.0, 1.0))
+        return float(np.clip(0.35 * sample_score + 0.40 * bpm_score + 0.25 * confidence_score, 0.0, 1.0))
+
+    @staticmethod
+    def _method_agreement_score(per_method_summary: dict[str, dict[str, float]]) -> float:
+        bpms = [
+            float(summary["median_bpm"])
+            for summary in per_method_summary.values()
+            if float(summary.get("samples", 0.0)) >= 5.0 and float(summary.get("median_bpm", 0.0)) > 0.0
+        ]
+        if len(bpms) <= 1:
+            return 1.0
+        spread = float(np.std(np.array(bpms, dtype=np.float64)))
+        return float(np.clip((15.0 - spread) / 15.0, 0.0, 1.0))
+
+    @staticmethod
+    def _agreement_support(per_method_summary: dict[str, dict[str, float]]) -> dict[str, Any]:
+        recoverable = {
+            name: float(summary["median_bpm"])
+            for name, summary in per_method_summary.items()
+            if float(summary.get("samples", 0.0)) >= 5.0 and float(summary.get("median_bpm", 0.0)) > 0.0
+        }
+        if not recoverable:
+            return {"recoverable_methods": 0, "agreeing_methods": 0, "has_chromatic_support": False}
+        anchor = float(np.median(np.array(list(recoverable.values()), dtype=np.float64)))
+        agreeing_names = [name for name, bpm in recoverable.items() if abs(bpm - anchor) <= 8.0]
+        has_chromatic_support = any(name in {"chrom", "pos"} for name in agreeing_names)
+        return {
+            "recoverable_methods": len(recoverable),
+            "agreeing_methods": len(agreeing_names),
+            "has_chromatic_support": has_chromatic_support,
+        }
 
     @staticmethod
     def _resolve_float(local_quality: dict[str, Any] | None, key: str, *, default: float) -> float:

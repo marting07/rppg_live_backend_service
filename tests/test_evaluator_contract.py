@@ -58,6 +58,29 @@ class EvaluatorContractTests(unittest.TestCase):
             self.assertTrue((out / "test_session" / "bpm_timeline.json").exists())
             self.assertIn("operational_metrics", result)
 
+    def test_finalize_reports_conservative_inconclusive_with_sane_timing(self) -> None:
+        evaluator = StreamEvaluator(fs=12.0)
+
+        for idx in range(80):
+            packet = make_packet(seq=idx, timestamp_ms=idx * 83)
+            evaluator.ingest_summary_packet(
+                seq=packet["seq"],
+                timestamp_ms=packet["timestamp_ms"],
+                patches=packet["patches"],
+                local_quality=packet["local_quality"],
+                payload_size_bytes=len(json.dumps(packet)),
+            )
+
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td)
+            result = evaluator.finalize("test_session_guardrail", out)
+            self.assertEqual(result["decision"], "inconclusive")
+            self.assertIn(result["failure_reasons"][0], {"low_recoverability", "single_method_evidence", "missing_chromatic_support"})
+            metrics = result["operational_metrics"]
+            self.assertGreater(metrics["time_to_first_estimate_ms"], 3000.0)
+            if metrics["time_to_stable_estimate_ms"] is not None:
+                self.assertLess(metrics["time_to_stable_estimate_ms"], 20000.0)
+
 
 if __name__ == "__main__":
     unittest.main()
