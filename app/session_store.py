@@ -61,6 +61,10 @@ class SessionStore:
         latest_quality = state.evaluator.quality_timeline[-1] if state.evaluator.quality_timeline else {}
         latest_result = state.evaluator.bpm_timeline[-1] if state.evaluator.bpm_timeline else {}
         latest_coherence = state.evaluator.coherence_timeline[-1] if state.evaluator.coherence_timeline else {}
+        latest_patch_group_bpm = state.evaluator.patch_group_bpm_timeline[-1] if state.evaluator.patch_group_bpm_timeline else {}
+        latest_patch_group_quality = (
+            state.evaluator.patch_group_quality_timeline[-1] if state.evaluator.patch_group_quality_timeline else {}
+        )
         return {
             "session_id": session_id,
             "status": state.status,
@@ -71,6 +75,8 @@ class SessionStore:
             "packets_accepted": state.evaluator.quality.accepted_packets,
             "latest_quality": latest_quality,
             "latest_coherence": latest_coherence,
+            "latest_patch_group_bpm": latest_patch_group_bpm,
+            "latest_patch_group_quality": latest_patch_group_quality,
             "latest_result_event": latest_result,
         }
 

@@ -67,6 +67,9 @@ class ApiContractTests(unittest.TestCase):
         dj = diagnostics.json()
         self.assertEqual(dj["session_id"], session_id)
         self.assertGreaterEqual(dj["packets_received"], 24)
+        self.assertIn("latest_coherence", dj)
+        self.assertIn("latest_patch_group_bpm", dj)
+        self.assertIn("latest_patch_group_quality", dj)
 
     def test_missing_token_rejected(self) -> None:
         create = self.client.post("/v1/liveness/sessions", json={})
