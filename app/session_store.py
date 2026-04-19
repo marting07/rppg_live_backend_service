@@ -60,6 +60,7 @@ class SessionStore:
             return None
         latest_quality = state.evaluator.quality_timeline[-1] if state.evaluator.quality_timeline else {}
         latest_result = state.evaluator.bpm_timeline[-1] if state.evaluator.bpm_timeline else {}
+        latest_coherence = state.evaluator.coherence_timeline[-1] if state.evaluator.coherence_timeline else {}
         return {
             "session_id": session_id,
             "status": state.status,
@@ -69,6 +70,7 @@ class SessionStore:
             "packets_received": state.evaluator.quality.total_packets,
             "packets_accepted": state.evaluator.quality.accepted_packets,
             "latest_quality": latest_quality,
+            "latest_coherence": latest_coherence,
             "latest_result_event": latest_result,
         }
 

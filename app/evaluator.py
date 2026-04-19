@@ -39,6 +39,8 @@ class StreamEvaluator:
     quality_timeline: list[dict[str, Any]] = field(default_factory=list)
     bpm_timeline: list[dict[str, Any]] = field(default_factory=list)
     coherence_timeline: list[dict[str, Any]] = field(default_factory=list)
+    patch_group_bpm_timeline: list[dict[str, Any]] = field(default_factory=list)
+    patch_group_quality_timeline: list[dict[str, Any]] = field(default_factory=list)
     _hr_history: dict[str, list[float]] = field(default_factory=dict)
     _conf_history: dict[str, list[float]] = field(default_factory=dict)
     _latest_result_event: dict[str, Any] | None = None
@@ -180,6 +182,34 @@ class StreamEvaluator:
                 "reasons": coherence_snapshot["reasons"],
             }
         )
+        self.patch_group_bpm_timeline.append(
+            {
+                "timestamp_ms": timestamp_ms,
+                "groups": {
+                    group: {
+                        "bpm": float(summary.get("bpm", 0.0)),
+                        "confidence": float(summary.get("confidence", 0.0)),
+                    }
+                    for group, summary in coherence_snapshot["group_summary"].items()
+                },
+            }
+        )
+        self.patch_group_quality_timeline.append(
+            {
+                "timestamp_ms": timestamp_ms,
+                "groups": {
+                    group: {
+                        "samples": float(summary.get("samples", 0.0)),
+                        "confidence": float(summary.get("confidence", 0.0)),
+                        "signal_std": float(summary.get("signal_std", 0.0)),
+                    }
+                    for group, summary in coherence_snapshot["group_summary"].items()
+                },
+                "sample_balance": coherence_snapshot["sample_balance"],
+                "confidence_balance": coherence_snapshot["confidence_balance"],
+                "signal_balance": coherence_snapshot["signal_balance"],
+            }
+        )
 
         result_event = self._build_result_event(seq=seq, timestamp_ms=timestamp_ms, method_state=method_state)
         response = {"accepted": 1, **packet_info}
@@ -312,6 +342,8 @@ class StreamEvaluator:
             "selected_method": self._primary_method,
             "corroboration_method": self._secondary_method,
             "coherence_summary": {
+                "decision_groups": ["forehead", "left_cheek", "right_cheek"],
+                "auxiliary_groups": [],
                 "score": coherence["score"],
                 "recoverable_groups": coherence["recoverable_groups"],
                 "agreeing_groups": coherence["agreeing_groups"],
@@ -366,12 +398,20 @@ class StreamEvaluator:
         (run_dir / "quality_timeline.json").write_text(json.dumps(self.quality_timeline, indent=2), encoding="utf-8")
         (run_dir / "bpm_timeline.json").write_text(json.dumps(self.bpm_timeline, indent=2), encoding="utf-8")
         (run_dir / "coherence_timeline.json").write_text(json.dumps(self.coherence_timeline, indent=2), encoding="utf-8")
+        (run_dir / "patch_group_bpm_timeline.json").write_text(
+            json.dumps(self.patch_group_bpm_timeline, indent=2), encoding="utf-8"
+        )
+        (run_dir / "patch_group_quality_timeline.json").write_text(
+            json.dumps(self.patch_group_quality_timeline, indent=2), encoding="utf-8"
+        )
         diagnostics = {
             "latest_result_kind": self._latest_result_kind,
             "packet_trace_path": str(run_dir / "packet_trace.jsonl"),
             "quality_timeline_path": str(run_dir / "quality_timeline.json"),
             "bpm_timeline_path": str(run_dir / "bpm_timeline.json"),
             "coherence_timeline_path": str(run_dir / "coherence_timeline.json"),
+            "patch_group_bpm_timeline_path": str(run_dir / "patch_group_bpm_timeline.json"),
+            "patch_group_quality_timeline_path": str(run_dir / "patch_group_quality_timeline.json"),
         }
         (run_dir / "diagnostics.json").write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
         return result

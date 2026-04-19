@@ -51,10 +51,14 @@ class EvaluatorContractTests(unittest.TestCase):
             self.assertTrue((out / "test_session" / "quality_timeline.json").exists())
             self.assertTrue((out / "test_session" / "bpm_timeline.json").exists())
             self.assertTrue((out / "test_session" / "coherence_timeline.json").exists())
+            self.assertTrue((out / "test_session" / "patch_group_bpm_timeline.json").exists())
+            self.assertTrue((out / "test_session" / "patch_group_quality_timeline.json").exists())
             self.assertIn("operational_metrics", result)
             self.assertIn("selected_method", result)
             self.assertIn("corroboration_method", result)
             self.assertIn("coherence_summary", result)
+            self.assertEqual(result["coherence_summary"]["decision_groups"], ["forehead", "left_cheek", "right_cheek"])
+            self.assertEqual(result["coherence_summary"]["auxiliary_groups"], [])
             self.assertIn("group_summary", result["coherence_summary"])
 
     def test_finalize_reports_conservative_inconclusive_with_sane_timing(self) -> None:
