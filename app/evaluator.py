@@ -38,6 +38,7 @@ class StreamEvaluator:
     packet_trace: list[dict[str, Any]] = field(default_factory=list)
     quality_timeline: list[dict[str, Any]] = field(default_factory=list)
     bpm_timeline: list[dict[str, Any]] = field(default_factory=list)
+    coherence_timeline: list[dict[str, Any]] = field(default_factory=list)
     _hr_history: dict[str, list[float]] = field(default_factory=dict)
     _conf_history: dict[str, list[float]] = field(default_factory=dict)
     _latest_result_event: dict[str, Any] | None = None
@@ -50,6 +51,9 @@ class StreamEvaluator:
     _session_start_seq: int | None = None
     _first_estimate_seq: int | None = None
     _first_stable_seq: int | None = None
+    _primary_method: str | None = None
+    _secondary_method: str | None = None
+    _patch_group_histories: dict[str, list[tuple[float, float, float]]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         buf = int(self.fs * self.buffer_seconds)
@@ -59,8 +63,11 @@ class StreamEvaluator:
             "pos": POSMethod(fs=self.fs, buffer_size=buf),
             "ica": ICAMethod(fs=self.fs, buffer_size=buf),
         }
+        preferred = (self.preferred_method or "").lower().strip()
+        self._primary_method = preferred if preferred in self.methods else "chrom"
         self._hr_history = {k: [] for k in self.methods}
         self._conf_history = {k: [] for k in self.methods}
+        self._patch_group_histories = {"forehead": [], "left_cheek": [], "right_cheek": []}
 
     def ingest_summary_packet(
         self,
@@ -135,6 +142,7 @@ class StreamEvaluator:
 
         self.quality.accepted_packets += 1
         self._accepted_bgr_history.append(bgr)
+        self._update_patch_group_histories(patches)
         roi = self._synthetic_roi_from_bgr(bgr)
         method_state: dict[str, dict[str, float]] = {}
         for name, method in self.methods.items():
@@ -151,6 +159,8 @@ class StreamEvaluator:
                     "confidence": float(conf) if conf is not None and np.isfinite(conf) else 0.0,
                 }
 
+        self._maybe_lock_secondary_method(method_state)
+
         self.quality_timeline.append(
             {
                 "timestamp_ms": timestamp_ms,
@@ -160,11 +170,26 @@ class StreamEvaluator:
                 "roi_coverage": coverage,
             }
         )
+        coherence_snapshot = self._current_patch_coherence()
+        self.coherence_timeline.append(
+            {
+                "timestamp_ms": timestamp_ms,
+                "score": coherence_snapshot["score"],
+                "recoverable_groups": coherence_snapshot["recoverable_groups"],
+                "agreeing_groups": coherence_snapshot["agreeing_groups"],
+                "reasons": coherence_snapshot["reasons"],
+            }
+        )
 
         result_event = self._build_result_event(seq=seq, timestamp_ms=timestamp_ms, method_state=method_state)
         response = {"accepted": 1, **packet_info}
         if result_event is not None:
             response["result_event"] = result_event
+        response["coherence"] = {
+            "score": coherence_snapshot["score"],
+            "recoverable_groups": coherence_snapshot["recoverable_groups"],
+            "agreeing_groups": coherence_snapshot["agreeing_groups"],
+        }
         return response
 
     def record_packet_gap(self, missing_packets: int) -> None:
@@ -210,10 +235,21 @@ class StreamEvaluator:
         method_ratio = float(np.mean(np.array(method_stability_scores, dtype=np.float64))) if method_stability_scores else 0.0
         plausibility = self._signal_plausibility(per_method_summary)
         agreement_support = self._agreement_support(per_method_summary)
+        coherence = self._current_patch_coherence()
         liveness_score = float(
-            np.clip(0.42 * method_ratio + 0.23 * quality_ratio + 0.15 * recoverability_rate + 0.20 * plausibility["score"], 0.0, 1.0)
+            np.clip(
+                0.34 * method_ratio
+                + 0.18 * quality_ratio
+                + 0.12 * recoverability_rate
+                + 0.18 * plausibility["score"]
+                + 0.18 * coherence["score"],
+                0.0,
+                1.0,
+            )
         )
-        confidence = float(np.clip((method_ratio + quality_ratio + recoverability_rate + plausibility["score"]) / 4.0, 0.0, 1.0))
+        confidence = float(
+            np.clip((method_ratio + quality_ratio + recoverability_rate + plausibility["score"] + coherence["score"]) / 5.0, 0.0, 1.0)
+        )
 
         decision = "live"
         failure_reasons: list[str] = []
@@ -226,15 +262,24 @@ class StreamEvaluator:
         elif recoverability_rate < 0.34:
             decision = "inconclusive"
             failure_reasons.append("low_recoverability")
-        elif agreement_support["recoverable_methods"] < 2:
+        elif self._secondary_method is None:
             decision = "inconclusive"
-            failure_reasons.append("single_method_evidence")
+            failure_reasons.append("no_corroboration_method")
         elif agreement_support["agreeing_methods"] < 2:
             decision = "inconclusive"
             failure_reasons.append("insufficient_method_agreement")
         elif not agreement_support["has_chromatic_support"]:
             decision = "inconclusive"
             failure_reasons.append("missing_chromatic_support")
+        elif coherence["recoverable_groups"] < 2:
+            decision = "inconclusive"
+            failure_reasons.append("insufficient_patch_coverage")
+        elif coherence["score"] < 0.55:
+            decision = "inconclusive"
+            failure_reasons.append("low_patch_coherence")
+        elif coherence["suspicious"]:
+            decision = "inconclusive"
+            failure_reasons.extend(coherence["reasons"])
         elif plausibility["score"] < 0.72:
             decision = "inconclusive"
             failure_reasons.append("weak_physiological_plausibility")
@@ -264,7 +309,18 @@ class StreamEvaluator:
             "decision": decision,
             "liveness_score": liveness_score,
             "confidence": confidence,
-            "selected_method": self._select_best_method(),
+            "selected_method": self._primary_method,
+            "corroboration_method": self._secondary_method,
+            "coherence_summary": {
+                "score": coherence["score"],
+                "recoverable_groups": coherence["recoverable_groups"],
+                "agreeing_groups": coherence["agreeing_groups"],
+                "sample_balance": coherence["sample_balance"],
+                "confidence_balance": coherence["confidence_balance"],
+                "signal_balance": coherence["signal_balance"],
+                "group_summary": coherence["group_summary"],
+                "reasons": coherence["reasons"],
+            },
             "method_scores": {name: float(summary.get("mean_confidence", 0.0)) for name, summary in per_method_summary.items()},
             "quality_summary": {
                 "accepted_ratio": quality_ratio,
@@ -296,6 +352,8 @@ class StreamEvaluator:
                 "recoverable_methods": float(agreement_support["recoverable_methods"]),
                 "agreeing_methods": float(agreement_support["agreeing_methods"]),
                 "has_chromatic_support": float(1 if agreement_support["has_chromatic_support"] else 0),
+                "primary_method_locked": float(1 if self._primary_method is not None else 0),
+                "secondary_method_locked": float(1 if self._secondary_method is not None else 0),
             },
             "failure_reasons": failure_reasons,
             "computed_at": datetime.now(UTC).isoformat(),
@@ -307,22 +365,27 @@ class StreamEvaluator:
         self._write_jsonl(run_dir / "packet_trace.jsonl", self.packet_trace)
         (run_dir / "quality_timeline.json").write_text(json.dumps(self.quality_timeline, indent=2), encoding="utf-8")
         (run_dir / "bpm_timeline.json").write_text(json.dumps(self.bpm_timeline, indent=2), encoding="utf-8")
+        (run_dir / "coherence_timeline.json").write_text(json.dumps(self.coherence_timeline, indent=2), encoding="utf-8")
         diagnostics = {
             "latest_result_kind": self._latest_result_kind,
             "packet_trace_path": str(run_dir / "packet_trace.jsonl"),
             "quality_timeline_path": str(run_dir / "quality_timeline.json"),
             "bpm_timeline_path": str(run_dir / "bpm_timeline.json"),
+            "coherence_timeline_path": str(run_dir / "coherence_timeline.json"),
         }
         (run_dir / "diagnostics.json").write_text(json.dumps(diagnostics, indent=2), encoding="utf-8")
         return result
 
     def _build_result_event(self, *, seq: int, timestamp_ms: int, method_state: dict[str, dict[str, float]]) -> dict[str, Any] | None:
-        if not method_state:
+        pair_state = self._pair_method_state(method_state)
+        if not pair_state:
             return None
-        selected_method = self._choose_method(method_state)
-        selected = method_state[selected_method]
-        confidences = np.array([entry["confidence"] for entry in method_state.values()], dtype=np.float64)
-        bpms = np.array([entry["bpm"] for entry in method_state.values()], dtype=np.float64)
+        selected_method = self._primary_method or self._choose_method(method_state)
+        if selected_method not in pair_state:
+            selected_method = next(iter(pair_state))
+        selected = pair_state[selected_method]
+        confidences = np.array([entry["confidence"] for entry in pair_state.values()], dtype=np.float64)
+        bpms = np.array([entry["bpm"] for entry in pair_state.values()], dtype=np.float64)
         stable = bool(
             bpms.size >= 2
             and np.std(bpms) <= 5.0
@@ -341,9 +404,10 @@ class StreamEvaluator:
         result_event = {
             "type": kind,
             "selected_method": selected_method,
+            "corroboration_method": self._secondary_method,
             "bpm": float(selected["bpm"]),
             "confidence": float(np.mean(confidences)),
-            "method_state": method_state,
+            "method_state": pair_state,
             "timestamp_ms": timestamp_ms,
         }
         self._latest_result_event = result_event
@@ -367,6 +431,43 @@ class StreamEvaluator:
             return ranked[0][2]
         return max(method_state.items(), key=lambda item: (item[1]["confidence"], item[1]["bpm"]))[0]
 
+    def _pair_method_state(self, method_state: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
+        pair_state: dict[str, dict[str, float]] = {}
+        primary = self._primary_method
+        if primary and primary in method_state:
+            pair_state[primary] = method_state[primary]
+        if self._secondary_method and self._secondary_method in method_state:
+            pair_state[self._secondary_method] = method_state[self._secondary_method]
+        if pair_state:
+            return pair_state
+        if primary and primary in method_state:
+            return {primary: method_state[primary]}
+        return method_state
+
+    def _maybe_lock_secondary_method(self, method_state: dict[str, dict[str, float]]) -> None:
+        if self._secondary_method is not None:
+            return
+        primary = self._primary_method
+        if primary is None or primary not in self.methods:
+            return
+        warmup_packets = int(self.fs * 4)
+        if self.quality.accepted_packets < warmup_packets:
+            return
+        candidates = []
+        for name in self.methods:
+            if name == primary:
+                continue
+            values = self._hr_history.get(name, [])
+            if len(values) < 5:
+                continue
+            mean_conf = float(np.mean(np.array(self._conf_history[name], dtype=np.float64))) if self._conf_history[name] else 0.0
+            current_conf = float(method_state.get(name, {}).get("confidence", 0.0))
+            candidates.append((mean_conf + 0.05 * current_conf, len(values), name))
+        if not candidates:
+            return
+        candidates.sort(reverse=True)
+        self._secondary_method = candidates[0][2]
+
     def _rank_methods(self, *, method_state: dict[str, dict[str, float]] | None = None) -> list[tuple[float, int, str]]:
         ranked = []
         for name, values in self._hr_history.items():
@@ -385,6 +486,158 @@ class StreamEvaluator:
         if delivered <= 0:
             return 0.0
         return float(self.quality.dropped_packets) / float(delivered)
+
+    def _update_patch_group_histories(self, patches: list[dict[str, Any]]) -> None:
+        grouped: dict[str, list[tuple[float, float, float, float]]] = {}
+        for patch in patches:
+            group = self._resolve_patch_group(patch)
+            mean_rgb = patch.get("mean_rgb", [])
+            if not isinstance(mean_rgb, list) or len(mean_rgb) != 3:
+                continue
+            weight = max(float(patch.get("weight", 1.0)), 1e-6)
+            # Incoming patch means are RGB; histories store BGR for consistency with the rest of the evaluator.
+            grouped.setdefault(group, []).append((float(mean_rgb[2]), float(mean_rgb[1]), float(mean_rgb[0]), weight))
+
+        max_len = int(self.fs * self.buffer_seconds)
+        for group in ("forehead", "left_cheek", "right_cheek"):
+            entries = grouped.get(group)
+            if not entries:
+                continue
+            weights = np.array([entry[3] for entry in entries], dtype=np.float64)
+            b = float(np.average(np.array([entry[0] for entry in entries], dtype=np.float64), weights=weights))
+            g = float(np.average(np.array([entry[1] for entry in entries], dtype=np.float64), weights=weights))
+            r = float(np.average(np.array([entry[2] for entry in entries], dtype=np.float64), weights=weights))
+            self._patch_group_histories[group].append((b, g, r))
+            if len(self._patch_group_histories[group]) > max_len:
+                self._patch_group_histories[group] = self._patch_group_histories[group][-max_len:]
+
+    def _current_patch_coherence(self) -> dict[str, Any]:
+        group_summary: dict[str, dict[str, float]] = {}
+        recoverable: dict[str, float] = {}
+        confidences: list[float] = []
+        for group, history in self._patch_group_histories.items():
+            estimate = self._estimate_patch_group_bpm(history)
+            if estimate is None:
+                signal_std = float(np.std(np.array(history, dtype=np.float64)[:, 1])) if history else 0.0
+                group_summary[group] = {
+                    "samples": float(len(history)),
+                    "bpm": 0.0,
+                    "confidence": 0.0,
+                    "signal_std": signal_std,
+                }
+                continue
+            bpm, confidence = estimate
+            signal_std = float(np.std(np.array(history, dtype=np.float64)[:, 1])) if history else 0.0
+            group_summary[group] = {
+                "samples": float(len(history)),
+                "bpm": bpm,
+                "confidence": confidence,
+                "signal_std": signal_std,
+            }
+            recoverable[group] = bpm
+            confidences.append(confidence)
+
+        if not recoverable:
+            return {
+                "score": 0.0,
+                "recoverable_groups": 0,
+                "agreeing_groups": 0,
+                "suspicious": True,
+                "reasons": ["no_patch_signal"],
+                "sample_balance": 0.0,
+                "confidence_balance": 0.0,
+                "signal_balance": 0.0,
+                "group_summary": group_summary,
+            }
+
+        bpm_values = np.array(list(recoverable.values()), dtype=np.float64)
+        anchor = float(np.median(bpm_values))
+        agreeing_groups = [group for group, bpm in recoverable.items() if abs(bpm - anchor) <= 8.0]
+        spread = float(np.std(bpm_values)) if bpm_values.size > 1 else 0.0
+        confidence_mean = float(np.mean(np.array(confidences, dtype=np.float64))) if confidences else 0.0
+        sample_counts = np.array(
+            [float(summary.get("samples", 0.0)) for group, summary in group_summary.items() if group in recoverable],
+            dtype=np.float64,
+        )
+        confidence_values = np.array(
+            [float(summary.get("confidence", 0.0)) for group, summary in group_summary.items() if group in recoverable],
+            dtype=np.float64,
+        )
+        signal_values = np.array(
+            [float(summary.get("signal_std", 0.0)) for group, summary in group_summary.items() if group in recoverable],
+            dtype=np.float64,
+        )
+        sample_balance = (
+            float(np.min(sample_counts) / max(np.max(sample_counts), 1e-6))
+            if sample_counts.size > 1 and float(np.max(sample_counts)) > 0.0
+            else 1.0
+        )
+        confidence_balance = (
+            float(np.min(confidence_values) / max(np.max(confidence_values), 1e-6))
+            if confidence_values.size > 1 and float(np.max(confidence_values)) > 0.0
+            else 1.0
+        )
+        signal_balance = (
+            float(np.min(signal_values) / max(np.max(signal_values), 1e-6))
+            if signal_values.size > 1 and float(np.max(signal_values)) > 0.0
+            else 1.0
+        )
+
+        coverage_score = float(np.clip(len(recoverable) / 3.0, 0.0, 1.0))
+        agreement_score = float(np.clip((12.0 - spread) / 12.0, 0.0, 1.0))
+        confidence_score = float(np.clip(confidence_mean / 0.45, 0.0, 1.0))
+        balance_score = float(np.clip((sample_balance + confidence_balance + signal_balance) / 3.0, 0.0, 1.0))
+        score = float(
+            np.clip(0.28 * coverage_score + 0.32 * agreement_score + 0.20 * confidence_score + 0.20 * balance_score, 0.0, 1.0)
+        )
+
+        reasons: list[str] = []
+        if len(recoverable) < 2:
+            reasons.append("single_patch_dominance")
+        if len(agreeing_groups) < 2:
+            reasons.append("low_patch_agreement")
+        if spread > 10.0:
+            reasons.append("patch_instability")
+        if confidence_balance < 0.55 or signal_balance < 0.45:
+            reasons.append("patch_quality_imbalance")
+        if sample_balance < 0.60:
+            reasons.append("patch_coverage_imbalance")
+
+        return {
+            "score": score,
+            "recoverable_groups": len(recoverable),
+            "agreeing_groups": len(agreeing_groups),
+            "suspicious": bool(reasons),
+            "reasons": reasons,
+            "sample_balance": sample_balance,
+            "confidence_balance": confidence_balance,
+            "signal_balance": signal_balance,
+            "group_summary": group_summary,
+        }
+
+    def _estimate_patch_group_bpm(self, history: list[tuple[float, float, float]]) -> tuple[float, float] | None:
+        min_samples = int(self.fs * 4)
+        if len(history) < min_samples:
+            return None
+        arr = np.array(history, dtype=np.float64)
+        green = arr[:, 1]
+        green = green - float(np.mean(green))
+        if float(np.std(green)) < 1e-6:
+            return None
+        windowed = green * np.hanning(green.size)
+        spectrum = np.abs(np.fft.rfft(windowed)) ** 2
+        freqs = np.fft.rfftfreq(green.size, d=1.0 / max(self.fs, 1e-6))
+        band = (freqs >= 0.70) & (freqs <= 3.00)
+        if not np.any(band):
+            return None
+        band_power = spectrum[band]
+        if not np.any(np.isfinite(band_power)) or float(np.sum(band_power)) <= 0.0:
+            return None
+        peak_idx = int(np.argmax(band_power))
+        peak_freq = float(freqs[band][peak_idx])
+        peak_power = float(band_power[peak_idx])
+        confidence = float(np.clip(peak_power / max(float(np.sum(band_power)), 1e-6), 0.0, 1.0))
+        return peak_freq * 60.0, confidence
 
     def _elapsed_or_none(self, timestamp_ms: int | None) -> float | None:
         if timestamp_ms is None or self._session_start_ms is None:
@@ -479,12 +732,14 @@ class StreamEvaluator:
         spread = float(np.std(np.array(bpms, dtype=np.float64)))
         return float(np.clip((15.0 - spread) / 15.0, 0.0, 1.0))
 
-    @staticmethod
-    def _agreement_support(per_method_summary: dict[str, dict[str, float]]) -> dict[str, Any]:
+    def _agreement_support(self, per_method_summary: dict[str, dict[str, float]]) -> dict[str, Any]:
+        pair_names = [name for name in [self._primary_method, self._secondary_method] if name]
         recoverable = {
             name: float(summary["median_bpm"])
             for name, summary in per_method_summary.items()
-            if float(summary.get("samples", 0.0)) >= 5.0 and float(summary.get("median_bpm", 0.0)) > 0.0
+            if name in pair_names
+            and float(summary.get("samples", 0.0)) >= 5.0
+            and float(summary.get("median_bpm", 0.0)) > 0.0
         }
         if not recoverable:
             return {"recoverable_methods": 0, "agreeing_methods": 0, "has_chromatic_support": False}
@@ -512,6 +767,26 @@ class StreamEvaluator:
         if local_quality is None:
             return default
         return bool(local_quality.get(key, default))
+
+    @staticmethod
+    def _resolve_patch_group(patch: dict[str, Any]) -> str:
+        explicit = str(patch.get("patch_group", "")).strip().lower()
+        if explicit in {"forehead", "left_cheek", "right_cheek"}:
+            return explicit
+        patch_id = str(patch.get("patch_id", "")).strip().lower()
+        if patch_id.startswith("forehead"):
+            return "forehead"
+        if patch_id.startswith("left_cheek"):
+            return "left_cheek"
+        if patch_id.startswith("right_cheek"):
+            return "right_cheek"
+        if "c0" in patch_id or patch_id.endswith("p0"):
+            return "left_cheek"
+        if "c1" in patch_id or patch_id.endswith("p1"):
+            return "forehead"
+        if "c2" in patch_id or patch_id.endswith("p2"):
+            return "right_cheek"
+        return "unknown"
 
     @staticmethod
     def _weighted_mean_bgr(patches: list[dict[str, Any]]) -> tuple[float, float, float]:
