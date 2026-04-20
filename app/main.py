@@ -132,6 +132,7 @@ async def stream(session_id: str, websocket: WebSocket) -> None:
                 timestamp_ms=timestamp_ms,
                 patches=patches,
                 local_quality=payload.get("local_quality"),
+                passive_artifacts=payload.get("passive_artifacts"),
                 payload_size_bytes=len(json.dumps(payload)),
             )
             await websocket.send_json(

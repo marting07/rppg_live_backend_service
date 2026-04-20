@@ -24,6 +24,13 @@ def make_packet(seq: int, timestamp_ms: int) -> dict[str, object]:
             "motion_score": 0.03,
             "roi_coverage": 0.95,
         },
+        "passive_artifacts": {
+            "moire_score": 0.10,
+            "brightness_banding_score": 0.14,
+            "reflectance_variation": 0.06,
+            "flat_contrast_score": 0.20,
+            "global_brightness_drift": 0.01,
+        },
     }
 
 
@@ -38,6 +45,7 @@ class EvaluatorContractTests(unittest.TestCase):
                 timestamp_ms=packet["timestamp_ms"],
                 patches=packet["patches"],
                 local_quality=packet["local_quality"],
+                passive_artifacts=packet["passive_artifacts"],
                 payload_size_bytes=len(json.dumps(packet)),
             )
             self.assertEqual(ingest["accepted"], 1)
@@ -51,12 +59,14 @@ class EvaluatorContractTests(unittest.TestCase):
             self.assertTrue((out / "test_session" / "quality_timeline.json").exists())
             self.assertTrue((out / "test_session" / "bpm_timeline.json").exists())
             self.assertTrue((out / "test_session" / "coherence_timeline.json").exists())
+            self.assertTrue((out / "test_session" / "replay_timeline.json").exists())
             self.assertTrue((out / "test_session" / "patch_group_bpm_timeline.json").exists())
             self.assertTrue((out / "test_session" / "patch_group_quality_timeline.json").exists())
             self.assertIn("operational_metrics", result)
             self.assertIn("selected_method", result)
             self.assertIn("corroboration_method", result)
             self.assertIn("coherence_summary", result)
+            self.assertIn("replay_summary", result)
             self.assertEqual(result["coherence_summary"]["decision_groups"], ["forehead", "left_cheek", "right_cheek"])
             self.assertEqual(result["coherence_summary"]["auxiliary_groups"], [])
             self.assertIn("group_summary", result["coherence_summary"])
@@ -71,6 +81,7 @@ class EvaluatorContractTests(unittest.TestCase):
                 timestamp_ms=packet["timestamp_ms"],
                 patches=packet["patches"],
                 local_quality=packet["local_quality"],
+                passive_artifacts=packet["passive_artifacts"],
                 payload_size_bytes=len(json.dumps(packet)),
             )
 
@@ -88,6 +99,11 @@ class EvaluatorContractTests(unittest.TestCase):
             self.assertIn("sample_balance", coherence)
             self.assertIn("confidence_balance", coherence)
             self.assertIn("signal_balance", coherence)
+            replay = result["replay_summary"]
+            self.assertIn("score", replay)
+            self.assertIn("moire_score", replay)
+            self.assertIn("banding_score", replay)
+            self.assertIn("reasons", replay)
             metrics = result["operational_metrics"]
             if metrics["time_to_first_estimate_ms"] is not None:
                 self.assertGreaterEqual(metrics["time_to_first_estimate_ms"], 0.0)

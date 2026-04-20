@@ -25,6 +25,13 @@ def make_summary_payload(seq: int, timestamp_ms: int) -> dict[str, object]:
             "motion_score": 0.04,
             "roi_coverage": 0.92,
         },
+        "passive_artifacts": {
+            "moire_score": 0.12,
+            "brightness_banding_score": 0.18,
+            "reflectance_variation": 0.05,
+            "flat_contrast_score": 0.22,
+            "global_brightness_drift": 0.01,
+        },
     }
 
 
@@ -61,6 +68,8 @@ class ApiContractTests(unittest.TestCase):
         self.assertEqual(rj["status"], "complete")
         self.assertIn(rj["decision"], ["live", "not_live", "inconclusive"])
         self.assertIn("operational_metrics", rj)
+        self.assertIn("replay_summary", rj)
+        self.assertIn("score", rj["replay_summary"])
 
         diagnostics = self.client.get(f"/v1/liveness/sessions/{session_id}/diagnostics")
         self.assertEqual(diagnostics.status_code, 200)
@@ -68,6 +77,7 @@ class ApiContractTests(unittest.TestCase):
         self.assertEqual(dj["session_id"], session_id)
         self.assertGreaterEqual(dj["packets_received"], 24)
         self.assertIn("latest_coherence", dj)
+        self.assertIn("latest_replay", dj)
         self.assertIn("latest_patch_group_bpm", dj)
         self.assertIn("latest_patch_group_quality", dj)
 

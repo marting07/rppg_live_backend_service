@@ -37,6 +37,7 @@ class SessionResultResponse(BaseModel):
     selected_method: str | None = None
     corroboration_method: str | None = None
     coherence_summary: dict[str, object] = Field(default_factory=dict)
+    replay_summary: dict[str, object] = Field(default_factory=dict)
     method_scores: dict[str, float] = Field(default_factory=dict)
     quality_summary: dict[str, float] = Field(default_factory=dict)
     operational_metrics: dict[str, float | None] = Field(default_factory=dict)

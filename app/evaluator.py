@@ -39,6 +39,7 @@ class StreamEvaluator:
     quality_timeline: list[dict[str, Any]] = field(default_factory=list)
     bpm_timeline: list[dict[str, Any]] = field(default_factory=list)
     coherence_timeline: list[dict[str, Any]] = field(default_factory=list)
+    replay_timeline: list[dict[str, Any]] = field(default_factory=list)
     patch_group_bpm_timeline: list[dict[str, Any]] = field(default_factory=list)
     patch_group_quality_timeline: list[dict[str, Any]] = field(default_factory=list)
     _hr_history: dict[str, list[float]] = field(default_factory=dict)
@@ -56,6 +57,7 @@ class StreamEvaluator:
     _primary_method: str | None = None
     _secondary_method: str | None = None
     _patch_group_histories: dict[str, list[tuple[float, float, float]]] = field(default_factory=dict)
+    _passive_artifact_history: list[dict[str, float]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         buf = int(self.fs * self.buffer_seconds)
@@ -78,6 +80,7 @@ class StreamEvaluator:
         timestamp_ms: int,
         patches: list[dict[str, Any]],
         local_quality: dict[str, Any] | None,
+        passive_artifacts: dict[str, Any] | None,
         payload_size_bytes: int,
     ) -> dict[str, Any]:
         self.quality.total_packets += 1
@@ -115,6 +118,8 @@ class StreamEvaluator:
         self.quality.mean_brightness += brightness
         self.quality.mean_motion_score += motion
         self.quality.mean_face_coverage += coverage
+        passive_snapshot = self._resolve_passive_artifacts(passive_artifacts)
+        self._passive_artifact_history.append(passive_snapshot)
 
         packet_info = {
             "seq": seq,
@@ -127,6 +132,7 @@ class StreamEvaluator:
             "inter_packet_ms": inter_packet_ms,
             "jitter_ms": jitter_ms,
             "payload_size_bytes": payload_size_bytes,
+            "passive_artifacts": passive_snapshot,
         }
         self.packet_trace.append(packet_info)
 
@@ -210,6 +216,17 @@ class StreamEvaluator:
                 "signal_balance": coherence_snapshot["signal_balance"],
             }
         )
+        replay_snapshot = self._current_replay_suspicion()
+        self.replay_timeline.append(
+            {
+                "timestamp_ms": timestamp_ms,
+                "score": replay_snapshot["score"],
+                "reasons": replay_snapshot["reasons"],
+                "banding_score": replay_snapshot["banding_score"],
+                "moire_score": replay_snapshot["moire_score"],
+                "flat_contrast_score": replay_snapshot["flat_contrast_score"],
+            }
+        )
 
         result_event = self._build_result_event(seq=seq, timestamp_ms=timestamp_ms, method_state=method_state)
         response = {"accepted": 1, **packet_info}
@@ -266,19 +283,33 @@ class StreamEvaluator:
         plausibility = self._signal_plausibility(per_method_summary)
         agreement_support = self._agreement_support(per_method_summary)
         coherence = self._current_patch_coherence()
+        replay = self._current_replay_suspicion()
         liveness_score = float(
             np.clip(
-                0.34 * method_ratio
-                + 0.18 * quality_ratio
+                0.30 * method_ratio
+                + 0.16 * quality_ratio
                 + 0.12 * recoverability_rate
-                + 0.18 * plausibility["score"]
-                + 0.18 * coherence["score"],
+                + 0.16 * plausibility["score"]
+                + 0.14 * coherence["score"]
+                + 0.12 * (1.0 - replay["score"]),
                 0.0,
                 1.0,
             )
         )
         confidence = float(
-            np.clip((method_ratio + quality_ratio + recoverability_rate + plausibility["score"] + coherence["score"]) / 5.0, 0.0, 1.0)
+            np.clip(
+                (
+                    method_ratio
+                    + quality_ratio
+                    + recoverability_rate
+                    + plausibility["score"]
+                    + coherence["score"]
+                    + (1.0 - replay["score"])
+                )
+                / 6.0,
+                0.0,
+                1.0,
+            )
         )
 
         decision = "live"
@@ -310,6 +341,12 @@ class StreamEvaluator:
         elif coherence["suspicious"]:
             decision = "inconclusive"
             failure_reasons.extend(coherence["reasons"])
+        elif replay["score"] >= 0.58:
+            decision = "inconclusive"
+            failure_reasons.extend(replay["reasons"])
+        elif replay["score"] >= 0.45 and (coherence["score"] < 0.62 or coherence["suspicious"]):
+            decision = "inconclusive"
+            failure_reasons.extend(replay["reasons"] or ["borderline_replay_suspicion"])
         elif plausibility["score"] < 0.72:
             decision = "inconclusive"
             failure_reasons.append("weak_physiological_plausibility")
@@ -352,6 +389,15 @@ class StreamEvaluator:
                 "signal_balance": coherence["signal_balance"],
                 "group_summary": coherence["group_summary"],
                 "reasons": coherence["reasons"],
+            },
+            "replay_summary": {
+                "score": replay["score"],
+                "moire_score": replay["moire_score"],
+                "banding_score": replay["banding_score"],
+                "flat_contrast_score": replay["flat_contrast_score"],
+                "reflectance_variation": replay["reflectance_variation"],
+                "brightness_drift": replay["brightness_drift"],
+                "reasons": replay["reasons"],
             },
             "method_scores": {name: float(summary.get("mean_confidence", 0.0)) for name, summary in per_method_summary.items()},
             "quality_summary": {
@@ -398,6 +444,7 @@ class StreamEvaluator:
         (run_dir / "quality_timeline.json").write_text(json.dumps(self.quality_timeline, indent=2), encoding="utf-8")
         (run_dir / "bpm_timeline.json").write_text(json.dumps(self.bpm_timeline, indent=2), encoding="utf-8")
         (run_dir / "coherence_timeline.json").write_text(json.dumps(self.coherence_timeline, indent=2), encoding="utf-8")
+        (run_dir / "replay_timeline.json").write_text(json.dumps(self.replay_timeline, indent=2), encoding="utf-8")
         (run_dir / "patch_group_bpm_timeline.json").write_text(
             json.dumps(self.patch_group_bpm_timeline, indent=2), encoding="utf-8"
         )
@@ -410,6 +457,7 @@ class StreamEvaluator:
             "quality_timeline_path": str(run_dir / "quality_timeline.json"),
             "bpm_timeline_path": str(run_dir / "bpm_timeline.json"),
             "coherence_timeline_path": str(run_dir / "coherence_timeline.json"),
+            "replay_timeline_path": str(run_dir / "replay_timeline.json"),
             "patch_group_bpm_timeline_path": str(run_dir / "patch_group_bpm_timeline.json"),
             "patch_group_quality_timeline_path": str(run_dir / "patch_group_quality_timeline.json"),
         }
@@ -655,6 +703,60 @@ class StreamEvaluator:
             "group_summary": group_summary,
         }
 
+    def _current_replay_suspicion(self) -> dict[str, Any]:
+        if not self._passive_artifact_history:
+            return {
+                "score": 0.0,
+                "moire_score": 0.0,
+                "banding_score": 0.0,
+                "flat_contrast_score": 0.0,
+                "reflectance_variation": 0.0,
+                "brightness_drift": 0.0,
+                "reasons": [],
+            }
+        arr = self._passive_artifact_history[-max(int(self.fs * 4), 1) :]
+        moire = float(np.mean(np.array([row["moire_score"] for row in arr], dtype=np.float64)))
+        banding = float(np.mean(np.array([row["brightness_banding_score"] for row in arr], dtype=np.float64)))
+        flat_contrast = float(np.mean(np.array([row["flat_contrast_score"] for row in arr], dtype=np.float64)))
+        reflectance_variation = float(np.mean(np.array([row["reflectance_variation"] for row in arr], dtype=np.float64)))
+        brightness_drift = float(np.mean(np.array([row["global_brightness_drift"] for row in arr], dtype=np.float64)))
+
+        low_reflectance_score = float(np.clip((0.04 - reflectance_variation) / 0.04, 0.0, 1.0))
+        low_drift_score = float(np.clip((0.01 - brightness_drift) / 0.01, 0.0, 1.0))
+        score = float(
+            np.clip(
+                0.28 * moire
+                + 0.24 * banding
+                + 0.20 * flat_contrast
+                + 0.18 * low_reflectance_score
+                + 0.10 * low_drift_score,
+                0.0,
+                1.0,
+            )
+        )
+        reasons: list[str] = []
+        if moire >= 0.62:
+            reasons.append("screen_artifact_suspected")
+        if banding >= 0.65:
+            reasons.append("brightness_banding_suspected")
+        if flat_contrast >= 0.70:
+            reasons.append("flat_contrast_profile")
+        if reflectance_variation <= 0.02:
+            reasons.append("low_natural_variation")
+        if brightness_drift <= 0.003 and flat_contrast >= 0.60:
+            reasons.append("brightness_dominant_periodicity")
+        if score >= 0.45 and reflectance_variation <= 0.03 and flat_contrast >= 0.55:
+            reasons.append("replay_suspicion_borderline")
+        return {
+            "score": score,
+            "moire_score": moire,
+            "banding_score": banding,
+            "flat_contrast_score": flat_contrast,
+            "reflectance_variation": reflectance_variation,
+            "brightness_drift": brightness_drift,
+            "reasons": reasons,
+        }
+
     def _estimate_patch_group_bpm(self, history: list[tuple[float, float, float]]) -> tuple[float, float] | None:
         min_samples = int(self.fs * 4)
         if len(history) < min_samples:
@@ -807,6 +909,25 @@ class StreamEvaluator:
         if local_quality is None:
             return default
         return bool(local_quality.get(key, default))
+
+    @staticmethod
+    def _resolve_passive_artifacts(passive_artifacts: dict[str, Any] | None) -> dict[str, float]:
+        def get_value(key: str) -> float:
+            if passive_artifacts is None:
+                return 0.0
+            value = passive_artifacts.get(key, 0.0)
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        return {
+            "moire_score": get_value("moire_score"),
+            "brightness_banding_score": get_value("brightness_banding_score"),
+            "reflectance_variation": get_value("reflectance_variation"),
+            "flat_contrast_score": get_value("flat_contrast_score"),
+            "global_brightness_drift": get_value("global_brightness_drift"),
+        }
 
     @staticmethod
     def _resolve_patch_group(patch: dict[str, Any]) -> str:
